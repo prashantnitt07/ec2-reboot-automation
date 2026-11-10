@@ -1,0 +1,177 @@
+
+---
+- name: EC2 Monthly Patching and Reboot Automation
+  hosts: ec2_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    maintenance_mode: "patch-and-reboot"
+    report_file: /var/tmp/ec2-reboot-service-report.txt
+
+  tasks:
+
+    # ----------------------------------
+    # STEP 1: Capture services before
+    # ----------------------------------
+
+    - name: Get all active systemd services before reboot
+      ansible.builtin.shell: |
+        systemctl list-units \
+          --type=service \
+          --state=active \
+          --no-legend \
+          --no-pager | awk '{print $1}' | sort -u
+      register: services_before
+      changed_when: false
+
+    - name: Display services before reboot
+      ansible.builtin.debug:
+        msg: "{{ services_before.stdout_lines }}"
+
+    - name: Save pre-reboot service list
+      ansible.builtin.copy:
+        content: "{{ services_before.stdout }}\n"
+        dest: /var/tmp/services-before-reboot.txt
+        mode: "0600"
+
+    # ----------------------------------
+    # STEP 2: Patch OS
+    # ----------------------------------
+
+    - name: Update package cache
+      ansible.builtin.apt:
+        update_cache: true
+      when: maintenance_mode == "patch-and-reboot"
+
+    - name: Upgrade packages
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+      when: maintenance_mode == "patch-and-reboot"
+
+    # ----------------------------------
+    # STEP 3: Reboot EC2
+    # ----------------------------------
+
+    - name: Reboot EC2 server
+      ansible.builtin.reboot:
+        msg: "EC2 reboot initiated by GitHub Actions"
+        reboot_timeout: 900
+        connect_timeout: 10
+        post_reboot_delay: 30
+        test_command: whoami
+
+    # ----------------------------------
+    # STEP 4: Capture services after
+    # ----------------------------------
+
+    - name: Get active services after reboot
+      ansible.builtin.shell: |
+        systemctl list-units \
+          --type=service \
+          --state=active \
+          --no-legend \
+          --no-pager | awk '{print $1}' | sort -u
+      register: services_after
+      changed_when: false
+
+    - name: Display services after reboot
+      ansible.builtin.debug:
+        msg: "{{ services_after.stdout_lines }}"
+
+    # ----------------------------------
+    # STEP 5: Compare service lists
+    # ----------------------------------
+
+    - name: Find missing services
+      ansible.builtin.set_fact:
+        missing_services: >-
+          {{ services_before.stdout_lines
+             | difference(services_after.stdout_lines) }}
+
+    - name: Display missing services
+      ansible.builtin.debug:
+        var: missing_services
+
+    # ----------------------------------
+    # STEP 6: Restart missing services
+    # ----------------------------------
+
+    - name: Restart missing services automatically
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ missing_services }}"
+      register: restart_results
+      failed_when: false
+
+    # ----------------------------------
+    # STEP 7: Final verification
+    # ----------------------------------
+
+    - name: Get final active services
+      ansible.builtin.shell: |
+        systemctl list-units \
+          --type=service \
+          --state=active \
+          --no-legend \
+          --no-pager | awk '{print $1}' | sort -u
+      register: final_services
+      changed_when: false
+
+    - name: Find services still down
+      ansible.builtin.set_fact:
+        failed_services: >-
+          {{ services_before.stdout_lines
+             | difference(final_services.stdout_lines) }}
+
+    # ----------------------------------
+    # STEP 8: Generate report
+    # ----------------------------------
+
+    - name: Create maintenance report
+      ansible.builtin.copy:
+        content: |
+          EC2 Maintenance Report
+          =====================
+
+          Server: {{ inventory_hostname }}
+          Mode: {{ maintenance_mode }}
+
+          Services Before Reboot:
+          {{ services_before.stdout }}
+
+          Services After Reboot:
+          {{ services_after.stdout }}
+
+          Services Restarted:
+          {{ missing_services | join('\n') }}
+
+          Services Still Down:
+          {{ failed_services | join('\n') }}
+
+          Final Status:
+          {% if failed_services | length == 0 %}
+          SUCCESS
+          {% else %}
+          FAILURE
+          {% endif %}
+        dest: "{{ report_file }}"
+        mode: "0600"
+
+    - name: Display final status
+      ansible.builtin.debug:
+        msg:
+          - "Services before: {{ services_before.stdout_lines | length }}"
+          - "Missing services: {{ missing_services }}"
+          - "Services still down: {{ failed_services }}"
+
+    # ----------------------------------
+    # STEP 9: Fail if recovery unsuccessful
+    # ----------------------------------
+
+    - name: Fail pipeline if any service remains down
+      ansible.builtin.fail:
+        msg: "Service recovery failed: {{ failed_services }}"
+      when: failed_services | length > 0
